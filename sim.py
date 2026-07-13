@@ -1,13 +1,17 @@
-"""Counter-FPV turret sim: PPO-trained turret vs scripted evasive drone.
+"""Counter-FPV turret sim: PPO turret vs evasive drone, with RL self-play.
 
-A drone spawns 120-180 m out and jinks toward the asset at the origin.
-The turret (at the origin) slews in az/el and fires ballistic projectiles
-with real flight time — the policy has to learn lead prediction.
+A drone spawns 120-180 m out and attacks the asset at the origin. The turret
+(at the origin) slews in az/el and fires ballistic projectiles with real flight
+time, so it must learn lead prediction. The drone is either a scripted jinker or
+its own PPO policy; `selfplay` alternately trains each side against the frozen
+other and plots the resulting arms race.
 
 Usage:
-    python sim.py test           # smoke checks (geometry + env contract)
-    python sim.py train [steps]  # train PPO (default 300_000), saves turret_ppo.zip
-    python sim.py watch          # run trained turret, saves episode.gif
+    python sim.py test              # smoke checks (physics + both env contracts)
+    python sim.py train [steps]     # train turret vs scripted drone -> turret_ppo.zip
+    python sim.py eval              # turret hit rate over 100 episodes
+    python sim.py watch             # render an episode -> episode.gif
+    python sim.py selfplay [rounds] # alternating self-play -> selfplay.png + models
 """
 
 import sys
@@ -21,7 +25,7 @@ EP_LEN = 600              # 30 s episode
 SPAWN_R = (120.0, 180.0)  # drone spawn distance, m
 ASSET_R = 5.0             # drone wins inside this radius of origin
 DRONE_SPEED = 25.0        # m/s cruise toward asset
-DRONE_ACC = 30.0          # m/s^2 jink authority
+DRONE_ACC = 30.0          # m/s^2 maneuver authority
 MUZZLE_V = 400.0          # m/s
 SLEW = 2.5                # rad/s max turret rate
 COOLDOWN = 0.5            # s between shots
@@ -31,6 +35,10 @@ OBS_NOISE = 1.5           # m std on measured drone position
 GRAV = np.array([0.0, 0.0, -9.81])
 
 
+def _unit(v):
+    return v / (np.linalg.norm(v) + 1e-9)
+
+
 def _seg_dist(a, b, p):
     """Distance from point p to segment a-b (projectile sweep vs drone)."""
     ab = b - a
@@ -38,41 +46,37 @@ def _seg_dist(a, b, p):
     return float(np.linalg.norm(a + t * ab - p))
 
 
-class TurretEnv(gym.Env):
-    """Obs: noisy drone pos/vel, own az/el, cooldown, ammo. Act: az/el rate + fire."""
+class World:
+    """Shared physics. step() takes a turret action and a drone acceleration;
+    both envs wrap this and translate their agent's action / build their obs."""
 
-    metadata = {"render_modes": []}
-
-    def __init__(self):
-        self.observation_space = spaces.Box(-np.inf, np.inf, (11,), np.float32)
-        # az rate, el rate in [-1,1] (scaled by SLEW), fire if > 0
-        self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)
-        self._freeze_drone = False  # test hook
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        rng = self.np_random
+    def reset(self, rng):
         az = rng.uniform(-np.pi, np.pi)
         r = rng.uniform(*SPAWN_R)
         self.drone = np.array([r * np.cos(az), r * np.sin(az), rng.uniform(10, 60)])
-        self.drone_vel = DRONE_SPEED * self._unit(-self.drone)
-        # per-episode jink pattern: two perpendicular sinusoids, random amp/freq/phase
+        self.drone_vel = DRONE_SPEED * _unit(-self.drone)
+        # scripted jink: two perpendicular sinusoids, random amp/freq/phase
         self.jink = rng.uniform([0.3 * DRONE_ACC, 0.5, 0], [DRONE_ACC, 2.0, 2 * np.pi], (2, 3))
         self.az, self.el = rng.uniform(-np.pi, np.pi), 0.0
         self.cool, self.ammo, self.t = 0.0, AMMO, 0
-        self.shots = []  # live projectiles: [pos, vel]
-        return self._obs(), {}
+        self.shots = []  # live projectiles: [pos, vel, min_dist_to_drone]
 
-    @staticmethod
-    def _unit(v):
-        return v / (np.linalg.norm(v) + 1e-9)
-
-    def _barrel(self):
+    def barrel(self):
         ce = np.cos(self.el)
         return np.array([ce * np.cos(self.az), ce * np.sin(self.az), np.sin(self.el)])
 
-    def _obs(self):
-        rng = self.np_random
+    def scripted_accel(self):
+        """Homing + perpendicular jink — the baseline (non-RL) drone."""
+        vhat = _unit(self.drone_vel)
+        b1 = _unit(np.cross(vhat, [0.0, 0.0, 1.0]))
+        b2 = np.cross(vhat, b1)
+        tt = self.t * DT
+        acc = 2.0 * (DRONE_SPEED * _unit(-self.drone) - self.drone_vel)
+        for (amp, freq, ph), b in zip(self.jink, (b1, b2)):
+            acc = acc + amp * np.sin(freq * tt + ph) * b
+        return acc
+
+    def turret_obs(self, rng):
         pos = self.drone + rng.normal(0, OBS_NOISE, 3)   # ponytail: perfect-detection noisy sensor; add dropout/latency for realism
         vel = self.drone_vel + rng.normal(0, 1.0, 3)
         return np.concatenate([
@@ -81,95 +85,177 @@ class TurretEnv(gym.Env):
              self.cool / COOLDOWN, self.ammo / AMMO],
         ]).astype(np.float32)
 
-    def step(self, action):
-        self.t += 1
-        reward = 0.0
+    def drone_obs(self):
+        # own state + barrel bearing + nearest incoming projectile (for dodging)
+        rel_p = np.zeros(3)
+        rel_v = np.zeros(3)
+        has = 0.0
+        if self.shots:
+            near = min(self.shots, key=lambda s: np.linalg.norm(s[0] - self.drone))
+            rel_p, rel_v, has = near[0] - self.drone, near[1], 1.0
+        return np.concatenate([
+            self.drone / 200.0, self.drone_vel / 50.0, self.barrel(),
+            rel_p / 200.0, rel_v / 400.0, [has],
+        ]).astype(np.float32)
 
-        # drone: home on origin + sinusoidal jink perpendicular to velocity
-        if not self._freeze_drone:
-            vhat = self._unit(self.drone_vel)
-            b1 = self._unit(np.cross(vhat, [0.0, 0.0, 1.0]))
-            b2 = np.cross(vhat, b1)
-            tt = self.t * DT
-            acc = 2.0 * (DRONE_SPEED * self._unit(-self.drone) - self.drone_vel)
-            for (amp, freq, ph), b in zip(self.jink, (b1, b2)):
-                acc = acc + amp * np.sin(freq * tt + ph) * b
-            self.drone_vel += acc * DT
-            speed = np.linalg.norm(self.drone_vel)
-            if speed > 1.2 * DRONE_SPEED:
-                self.drone_vel *= 1.2 * DRONE_SPEED / speed
-            self.drone = self.drone + self.drone_vel * DT
-            self.drone[2] = max(self.drone[2], 1.0)
+    def step(self, turret_action, drone_accel):
+        """Advance one tick. Returns (hit, reached, fired, nearmiss_bonus)."""
+        self.t += 1
+
+        # drone integrate (accel from script or policy), capped, floored
+        self.drone_vel = self.drone_vel + drone_accel * DT
+        speed = np.linalg.norm(self.drone_vel)
+        if speed > 1.2 * DRONE_SPEED:
+            self.drone_vel *= 1.2 * DRONE_SPEED / speed
+        self.drone = self.drone + self.drone_vel * DT
+        self.drone[2] = max(self.drone[2], 1.0)
 
         # turret slew + fire
-        self.az += float(np.clip(action[0], -1, 1)) * SLEW * DT
-        self.el = float(np.clip(self.el + float(np.clip(action[1], -1, 1)) * SLEW * DT,
+        self.az += float(np.clip(turret_action[0], -1, 1)) * SLEW * DT
+        self.el = float(np.clip(self.el + float(np.clip(turret_action[1], -1, 1)) * SLEW * DT,
                                 -0.2, np.pi / 2))
         self.cool = max(0.0, self.cool - DT)
-        if action[2] > 0 and self.cool == 0.0 and self.ammo > 0:
-            self.shots.append([np.zeros(3), MUZZLE_V * self._barrel(), np.inf])
-            self.cool, self.ammo = COOLDOWN, self.ammo - 1
-            reward -= 0.02
+        fired = False
+        if turret_action[2] > 0 and self.cool == 0.0 and self.ammo > 0:
+            self.shots.append([np.zeros(3), MUZZLE_V * self.barrel(), np.inf])
+            self.cool, self.ammo, fired = COOLDOWN, self.ammo - 1, True
 
         # projectiles: swept hit check against drone
-        hit, live = False, []
+        hit, nearmiss, live = False, 0.0, []
         for pos, vel, min_d in self.shots:
             new_pos = pos + vel * DT
-            d = _seg_dist(pos, new_pos, self.drone)
-            min_d = min(min_d, d)
-            if d < HIT_R:
+            min_d = min(min_d, _seg_dist(pos, new_pos, self.drone))
+            if min_d < HIT_R:
                 hit = True
                 continue
             vel = vel + GRAV * DT
             if new_pos[2] > 0 and np.linalg.norm(new_pos) < 500:
                 live.append([new_pos, vel, min_d])
             else:
-                # near-miss shaping: credit shots by closest approach, else "fire" never leaves the do-nothing optimum
-                reward += 0.3 * np.exp(-min_d / 10.0)
+                # near-miss credit: shots scored by closest approach, else "fire" never leaves the do-nothing optimum
+                nearmiss += np.exp(-min_d / 10.0)
         self.shots = live
+        reached = np.linalg.norm(self.drone) < ASSET_R
+        return hit, reached, fired, nearmiss
 
-        # shaping: penalize aim error so tracking is learned before lead
-        ang = np.arccos(np.clip(np.dot(self._barrel(), self._unit(self.drone)), -1, 1))
-        reward -= 0.01 * ang
 
+class TurretEnv(gym.Env):
+    """Agent = turret. Opponent drone: scripted (None) or a frozen PPO policy."""
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, opponent_drone=None):
+        self.observation_space = spaces.Box(-np.inf, np.inf, (11,), np.float32)
+        self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)  # az rate, el rate, fire>0
+        self.opponent = opponent_drone
+        self.world = World()
+        self._freeze_drone = False  # test hook
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.world.reset(self.np_random)
+        return self.world.turret_obs(self.np_random), {}
+
+    def _drone_accel(self):
+        if self._freeze_drone:
+            return np.zeros(3)
+        if self.opponent is None:
+            return self.world.scripted_accel()
+        act, _ = self.opponent.predict(self.world.drone_obs(), deterministic=True)
+        return np.clip(act, -1, 1) * DRONE_ACC
+
+    def step(self, action):
+        hit, reached, fired, nearmiss = self.world.step(action, self._drone_accel())
+        reward = (-0.02 if fired else 0.0) + 0.3 * nearmiss
+        ang = np.arccos(np.clip(np.dot(self.world.barrel(), _unit(self.world.drone)), -1, 1))
+        reward -= 0.01 * ang  # aim-error shaping: learn tracking before lead
         terminated = False
         if hit:
             reward, terminated = reward + 10.0, True
-        elif np.linalg.norm(self.drone) < ASSET_R:
+        elif reached:
             reward, terminated = reward - 10.0, True
-        return self._obs(), reward, terminated, self.t >= EP_LEN, {"hit": hit}
+        trunc = self.world.t >= EP_LEN
+        return self.world.turret_obs(self.np_random), reward, terminated, trunc, {"hit": hit}
+
+
+class DroneEnv(gym.Env):
+    """Agent = drone (attack the origin, dodge shots). Turret: frozen policy or passive (None)."""
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, turret_model=None):
+        self.observation_space = spaces.Box(-np.inf, np.inf, (16,), np.float32)
+        self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)  # accel direction, scaled by DRONE_ACC
+        self.turret_model = turret_model
+        self.world = World()
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.world.reset(self.np_random)
+        return self.world.drone_obs(), {}
+
+    def _turret_action(self):
+        if self.turret_model is None:
+            return np.zeros(3)  # passive turret (contract-test / null opponent)
+        act, _ = self.turret_model.predict(self.world.turret_obs(self.np_random), deterministic=True)
+        return act
+
+    def step(self, action):
+        drone_accel = np.clip(action, -1, 1) * DRONE_ACC
+        hit, reached, _, _ = self.world.step(self._turret_action(), drone_accel)
+        # mission: reach the asset alive
+        reward = -0.01 - 0.02 * np.linalg.norm(self.world.drone) / 200.0
+        terminated = False
+        if hit:
+            reward, terminated = reward - 10.0, True
+        elif reached:
+            reward, terminated = reward + 10.0, True
+        trunc = self.world.t >= EP_LEN
+        return self.world.drone_obs(), reward, terminated, trunc, {"reached": reached}
+
+
+def hit_rate(turret_model, drone_model=None, episodes=100):
+    """Turret interception rate against the given drone (scripted if None)."""
+    env = TurretEnv(opponent_drone=drone_model)
+    hits = 0
+    for i in range(episodes):
+        obs, _ = env.reset(seed=2000 + i)
+        while True:
+            act, _ = turret_model.predict(obs, deterministic=True)
+            obs, _, term, trunc, info = env.step(act)
+            if term or trunc:
+                hits += info["hit"]
+                break
+    return hits / episodes
 
 
 def test():
     from gymnasium.utils.env_checker import check_env
     check_env(TurretEnv())
+    check_env(DroneEnv())  # null (passive) turret
 
     # geometry: frozen drone dead ahead, aim straight at it, fire -> must hit
     env = TurretEnv()
     env.reset(seed=0)
     env._freeze_drone = True
-    env.drone = np.array([100.0, 0.0, 10.0])
-    env.drone_vel = np.zeros(3)
-    env.az, env.el = 0.0, np.arctan2(10.0, 100.0)
-    hit = False
-    for _ in range(20):
-        _, _, term, _, info = env.step(np.array([0.0, 0.0, 1.0], np.float32))
-        if info["hit"]:
-            hit = True
-            break
-    assert hit, "point-blank ballistic shot missed a frozen drone"
+    env.world.drone = np.array([100.0, 0.0, 10.0])
+    env.world.drone_vel = np.zeros(3)
+    env.world.az, env.world.el = 0.0, np.arctan2(10.0, 100.0)
+    assert any(env.step(np.array([0.0, 0.0, 1.0], np.float32))[4]["hit"] for _ in range(20)), \
+        "point-blank ballistic shot missed a frozen drone"
 
-    # random policy: episodes must terminate and drone must be able to win
-    env = TurretEnv()
-    outcomes = []
-    for i in range(5):
-        env.reset(seed=i)
-        while True:
-            _, r, term, trunc, _ = env.step(env.action_space.sample())
-            if term or trunc:
-                outcomes.append(r)
-                break
-    assert len(outcomes) == 5
+    # both envs: random policy episodes must terminate
+    for Env in (TurretEnv, DroneEnv):
+        env = Env()
+        for i in range(3):
+            env.reset(seed=i)
+            steps = 0
+            while True:
+                _, _, term, trunc, _ = env.step(env.action_space.sample())
+                steps += 1
+                if term or trunc:
+                    break
+            assert steps <= EP_LEN
     print("all checks passed")
 
 
@@ -179,24 +265,64 @@ def train(steps=300_000):
     model = PPO("MlpPolicy", make_vec_env(TurretEnv, n_envs=8), verbose=1)
     model.learn(total_timesteps=steps)
     model.save("turret_ppo")
-    print("saved turret_ppo.zip")
-    evaluate(model)
+    print(f"saved turret_ppo.zip | hit rate: {hit_rate(model):.2f}")
 
 
-def evaluate(model=None, episodes=100):
-    if model is None:
-        from stable_baselines3 import PPO
-        model = PPO.load("turret_ppo")
-    env, hits = TurretEnv(), 0
-    for i in range(episodes):
-        obs, _ = env.reset(seed=1000 + i)
-        while True:
-            act, _ = model.predict(obs, deterministic=True)
-            obs, _, term, trunc, info = env.step(act)
-            if term or trunc:
-                hits += info["hit"]
-                break
-    print(f"hit rate: {hits}/{episodes}")
+def evaluate():
+    from stable_baselines3 import PPO
+    print(f"hit rate: {hit_rate(PPO.load('turret_ppo')):.2f}")
+
+
+def selfplay(rounds=4, steps=500_000):
+    """Alternate: train the stale side against the frozen fresh side, warm-started.
+    Track the turret's hit rate each round -> arms-race curve."""
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.env_util import make_vec_env
+
+    turret = PPO.load("turret_ppo")            # gen-0: already trained vs scripted
+    drone = None
+    hist = [("g0 turret\nvs scripted", hit_rate(turret))]
+    print(f"g0: turret vs scripted -> {hist[0][1]:.2f}")
+
+    for r in range(1, rounds + 1):
+        if r % 2 == 1:  # drone's turn to adapt to the current turret
+            venv = make_vec_env(DroneEnv, n_envs=8, env_kwargs={"turret_model": turret})
+            if drone is None:
+                drone = PPO("MlpPolicy", venv, verbose=0)
+            else:
+                drone.set_env(venv)
+            drone.learn(total_timesteps=steps)
+            label = f"g{r} drone\nadapts"
+        else:           # turret's turn to adapt to the current drone
+            turret.set_env(make_vec_env(TurretEnv, n_envs=8, env_kwargs={"opponent_drone": drone}))
+            turret.learn(total_timesteps=steps)
+            label = f"g{r} turret\nadapts"
+        hr = hit_rate(turret, drone)
+        hist.append((label, hr))
+        print(f"round {r}: {label.replace(chr(10), ' ')} -> turret hit rate {hr:.2f}")
+
+    turret.save("turret_selfplay")
+    if drone is not None:
+        drone.save("drone_selfplay")
+
+    import matplotlib.pyplot as plt
+    labels = [h[0] for h in hist]
+    rates = [h[1] for h in hist]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(range(len(rates)), rates, "o-", lw=2)
+    for i, (lab, rt) in enumerate(zip(labels, rates)):
+        col = "tab:blue" if "turret" in lab else "tab:red"
+        ax.scatter(i, rt, color=col, zorder=3, s=60)
+        ax.annotate(f"{rt:.2f}", (i, rt), textcoords="offset points", xytext=(0, 8), ha="center")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("turret interception rate")
+    ax.set_title("Self-play arms race: turret vs learning drone")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("selfplay.png", dpi=120)
+    print("saved selfplay.png + turret_selfplay.zip / drone_selfplay.zip")
 
 
 def watch():
@@ -211,7 +337,8 @@ def watch():
     while True:
         act, _ = model.predict(obs, deterministic=True)
         obs, _, term, trunc, info = env.step(act)
-        frames.append((env.drone.copy(), env._barrel(), [p.copy() for p, _, _ in env.shots]))
+        w = env.world
+        frames.append((w.drone.copy(), w.barrel(), [p.copy() for p, _, _ in w.shots]))
         if term or trunc:
             print("HIT" if info["hit"] else "drone survived/reached asset")
             break
@@ -237,11 +364,14 @@ def watch():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "test"
+    arg = int(sys.argv[2]) if len(sys.argv) > 2 else None
     if cmd == "train":
-        train(int(sys.argv[2]) if len(sys.argv) > 2 else 300_000)
+        train(arg or 300_000)
     elif cmd == "watch":
         watch()
     elif cmd == "eval":
         evaluate()
+    elif cmd == "selfplay":
+        selfplay(arg or 4)
     else:
         test()
