@@ -1,4 +1,8 @@
 __pycache__/
 *.zip
 *.pt
+*.parquet
 episode.gif
+realdata/
+yolo_ds/
+runs/

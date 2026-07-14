@@ -81,6 +81,29 @@ falloff — *not* photorealism. It makes the detector's inputs real; it does **n
 the closed-loop finding above (that was geometry/range, not fidelity). Runs headless via
 `moderngl.create_standalone_context()` — no display needed.
 
+**Real-image detector (YOLO on real photos).** The synthetic and 3D-rendered detectors
+prove the pipeline works; this proves it survives real imagery. `yolo_real.py` fine-tunes
+a pretrained **YOLO11n** on 2625 real drone photographs (the public
+`pathikg/drone-detection-dataset` from Hugging Face, converted COCO→YOLO) on the GPU.
+On 375 held-out images: **mAP@50 0.974, precision 0.965, recall 0.947.**
+
+![real samples](real_samples.png)
+
+Measuring the same thing the synthetic curve does — recall vs apparent size — tells an
+honest, *opposite* story: the real pretrained detector barely degrades, holding **0.84
+recall even on ~8 px drones** and ~1.0 through the mid-range:
+
+![real detection](real_detection.png)
+
+That contrast **is** the finding. The from-scratch tiny CNN on synthetic frames collapsed
+past ~60 m; a strong pretrained detector on real photos does not. So "perception breaks
+with range" is a property of *that toy detector + synthetic data*, not a law of the
+problem — a real off-the-shelf model is far more capable. (Caveat: the flat curve also
+reflects this dataset's size distribution and that its "small" drones are still fairly
+visible; a genuine long-range/low-contrast set would push it back down.) This detector is
+standalone — real photos don't share the sim's engagement geometry — so it complements the
+in-loop synthetic detector rather than replacing it.
+
 ## How the stages fit
 
 ```
@@ -107,7 +130,13 @@ python sim.py perception         # detector-in-the-loop hit rate (image -> track
 python detect.py                 # train blob detector -> detection.png + detector.pt
 python detect.py 3d              # train on moderngl 3D frames -> sample3d.png + detection3d.png
 python render3d.py test          # 3D renderer: projection-match + size-falloff checks
+python yolo_real.py prepare      # real HF dataset (parquet) -> yolo_ds/ YOLO format
+python yolo_real.py train [ep]   # fine-tune yolo11n on real photos (GPU) -> runs/
+python yolo_real.py curve        # recall-vs-size + sample predictions on real data
 ```
+
+The real-image detector needs `pip install ultralytics pyarrow`, a CUDA torch, and
+`realdata/test.parquet` (~275 MB, `pathikg/drone-detection-dataset` on Hugging Face).
 
 ## Scope & non-goals
 
@@ -124,8 +153,9 @@ Deliberate boundaries, stated up front:
   renderer is a stylized matplotlib view on purpose.
 - **Physics is point-mass**, not rotor-level 6-DOF — it captures the target
   motion envelope the turret cares about, not blade aerodynamics.
-- **The detector is fused into the live control loop** (`sim.py perception`), which
-  exposed the range-mismatch problem above. A fuller pipeline would train it on real
-  anti-UAV imagery (Anti-UAV, Drone-vs-Bird) instead of synthetic frames, add
-  false-positive metrics, layer a longer-range sensor for early track, and retrain
-  the controller (with memory) on the fused sensor.
+- **Real imagery is now covered by the YOLO detector** (`yolo_real.py`, mAP@50 0.974),
+  but *standalone* — it isn't wired into the live control loop, because real photos don't
+  share the sim's engagement geometry. Fusing a real-trained detector into the loop would
+  need a domain bridge (render the sim through a real-image style, or key the controller
+  off detections in real footage), plus a longer-range sensor for early track and a
+  controller retrained (with memory) on the fused sensor.
