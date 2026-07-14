@@ -63,32 +63,33 @@ def backproject(u, v, R, az, el):
     return R * d / (np.linalg.norm(d) + 1e-9)
 
 
+def _background(rng, img=IMG):
+    """Domain-randomized sky/ground/cloud/noise background (no drone). Returns (im, xx, yy)."""
+    yy, xx = np.mgrid[0:img, 0:img]
+    top, bot = rng.uniform(0.6, 0.85), rng.uniform(0.4, 0.65)     # sky gradient
+    im = np.linspace(top, bot, img)[:, None].repeat(img, 1)
+    if rng.random() < 0.7:                                        # ground band
+        h = int(rng.uniform(0.6, 0.95) * img)
+        im[h:, :] = rng.uniform(0.3, 0.6) + rng.normal(0, 0.05, (img - h, img))
+    for _ in range(int(rng.integers(0, 4))):                      # clouds (bright, opposite polarity)
+        cu, cv, crad = rng.uniform(0, 1) * img, rng.uniform(0, 0.6) * img, rng.uniform(6, 16)
+        im = im + rng.uniform(0.05, 0.15) * np.exp(-((xx - cu) ** 2 + (yy - cv) ** 2) / (2 * crad ** 2))
+    return im + rng.normal(0, NOISE, (img, img)), xx, yy
+
+
+def _distractors(im, rng, xx, yy):
+    """Dark birds/debris — false-positive pressure, kept modest so the near drone dominates."""
+    h, w = im.shape
+    for _ in range(int(rng.integers(0, 3))):
+        du, dv, drad = rng.uniform(0, 1) * w, rng.uniform(0, 1) * h, rng.uniform(0.8, 2.2)
+        im = im - rng.uniform(0.1, 0.28) * np.exp(-((xx - du) ** 2 + (yy - dv) ** 2) / (2 * drad ** 2))
+    return im
+
+
 def render_frame(rng, present=None, range_m=None, uv=None, clutter=True):
-    """Return (img[IMG,IMG] float01, label[present,u,v]).
-
-    Domain-randomized background (sky gradient, ground band, clouds, noise) so a
-    CNN trained here generalizes; the drone is a dark blob with size ~1/R and
-    contrast fading with range (haze). Optional dark distractors add false-positive
-    pressure — at far range the ~1px drone aliases with them, which is why far
-    detection collapses."""
-    yy, xx = np.mgrid[0:IMG, 0:IMG]
-
-    # sky: randomized vertical gradient
-    top, bot = rng.uniform(0.6, 0.85), rng.uniform(0.4, 0.65)
-    img = np.linspace(top, bot, IMG)[:, None].repeat(IMG, 1)
-
-    # ground band (random horizon height + texture)
-    if rng.random() < 0.7:
-        h = int(rng.uniform(0.6, 0.95) * IMG)
-        img[h:, :] = rng.uniform(0.3, 0.6) + rng.normal(0, 0.05, (IMG - h, IMG))
-
-    # clouds: a few bright soft blobs (opposite polarity to the drone)
-    for _ in range(int(rng.integers(0, 4))):
-        cu, cv, crad = rng.uniform(0, 1) * IMG, rng.uniform(0, 0.6) * IMG, rng.uniform(6, 16)
-        img = img + rng.uniform(0.05, 0.15) * np.exp(-((xx - cu) ** 2 + (yy - cv) ** 2) / (2 * crad ** 2))
-
-    img = img + rng.normal(0, NOISE, (IMG, IMG))
-
+    """Blob drone (fast, FOV-independent size ~1/R) on a randomized background.
+    Returns (img[IMG,IMG] float01, label[present,u,v])."""
+    im, xx, yy = _background(rng)
     if present is None:
         present = rng.random() > 0.3          # 30% empty frames
     u = v = 0.0
@@ -97,15 +98,10 @@ def render_frame(rng, present=None, range_m=None, uv=None, clutter=True):
         R = range_m if range_m is not None else rng.uniform(NEAR, FAR)
         rad = float(np.clip(K_APPARENT / R, 0.6, 8.0))
         amp = 0.6 * float(np.clip((NEAR / R) ** 0.9, 0.12, 1.0))   # haze: contrast fades with range
-        img = img - amp * np.exp(-((xx - u * IMG) ** 2 + (yy - v * IMG) ** 2) / (2 * rad ** 2))
-
-    # dark distractors (birds/debris): modest, so the near drone still dominates
+        im = im - amp * np.exp(-((xx - u * IMG) ** 2 + (yy - v * IMG) ** 2) / (2 * rad ** 2))
     if clutter:
-        for _ in range(int(rng.integers(0, 3))):
-            du, dv, drad = rng.uniform(0, 1) * IMG, rng.uniform(0, 1) * IMG, rng.uniform(0.8, 2.2)
-            img = img - rng.uniform(0.1, 0.28) * np.exp(-((xx - du) ** 2 + (yy - dv) ** 2) / (2 * drad ** 2))
-
-    return np.clip(img, 0, 1).astype(np.float32), np.array([float(present), u, v], np.float32)
+        im = _distractors(im, rng, xx, yy)
+    return np.clip(im, 0, 1).astype(np.float32), np.array([float(present), u, v], np.float32)
 
 
 def _torch():
@@ -123,7 +119,8 @@ def make_net():
             self.body = nn.Sequential(
                 nn.Conv2d(1, 16, 3, 2, 1), nn.ReLU(),
                 nn.Conv2d(16, 32, 3, 2, 1), nn.ReLU(),
-                nn.Conv2d(32, 32, 3, 2, 1), nn.ReLU(), nn.Flatten())
+                nn.Conv2d(32, 32, 3, 2, 1), nn.ReLU(),
+                nn.AdaptiveAvgPool2d((8, 8)), nn.Flatten())  # resolution-agnostic (64 or 96px); no-op at 64
             self.head = nn.Sequential(nn.Linear(32 * 8 * 8, 64), nn.ReLU(), nn.Linear(64, 3))
 
         def forward(self, x):
@@ -182,6 +179,123 @@ def eval_vs_range(net, dev, per_bin=400, tol=0.09):
     return mids, rates
 
 
+# --- realistic 3D drone path (moderngl renderer) ---
+IMG3D, NEAR3D, FAR3D, SIZE3D = 96, 12.0, 84.0, 4.0
+
+
+def _make_renderer():
+    import render3d
+    return render3d.DroneRenderer(img=IMG3D, fov_deg=float(np.degrees(FOV)), size=SIZE3D)
+
+
+def render_frame_3d(rng, renderer, present=None, range_m=None):
+    """Lit 3D quad (moderngl) composited on the randomized background. Label from project()."""
+    im, xx, yy = _background(rng, IMG3D)
+    u = v = 0.0
+    if present is None:
+        present = rng.random() > 0.3
+    if present:
+        R = range_m if range_m is not None else rng.uniform(NEAR3D, FAR3D)
+        az, el = rng.uniform(-np.pi, np.pi), rng.uniform(-0.1, 0.6)
+        u, v = rng.uniform(0.15, 0.85), rng.uniform(0.15, 0.85)
+        rel = backproject(u, v, R, az, el)                       # place drone so it lands at (u,v)
+        gray, mask = renderer.render(rel, az, el)
+        m = mask * float(np.clip((NEAR3D / R) ** 0.5, 0.3, 1.0))  # atmospheric contrast fade
+        im = im * (1 - m) + gray * m
+    im = _distractors(im, rng, xx, yy)
+    return np.clip(im, 0, 1).astype(np.float32), np.array([float(present), u, v], np.float32)
+
+
+def build_3d_dataset(renderer, n=16000, seed=0):
+    torch, _ = _torch()
+    rng = np.random.default_rng(seed)
+    xs, ys = [], []
+    for i in range(n):
+        img, lab = render_frame_3d(rng, renderer)
+        xs.append(img); ys.append(lab)
+        if (i + 1) % 4000 == 0:
+            print(f"  rendered {i + 1}/{n} frames")
+    return torch.tensor(np.array(xs))[:, None], torch.tensor(np.array(ys))
+
+
+def train_on_dataset(X, Y, epochs=25, bs=128):
+    torch, nn = _torch()
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"training 3D detector on {dev} ({len(X)} frames x {epochs} epochs)")
+    net = make_net().to(dev)
+    opt = torch.optim.Adam(net.parameters(), 1e-3)
+    bce, mse = nn.BCEWithLogitsLoss(), nn.MSELoss()
+    n = len(X)
+    for ep in range(epochs):
+        perm = torch.randperm(n)
+        tot = 0.0
+        for i in range(0, n, bs):
+            idx = perm[i:i + bs]
+            x, y = X[idx].to(dev), Y[idx].to(dev)
+            out = net(x)
+            mask = y[:, 0] > 0.5
+            loss = bce(out[:, 0], y[:, 0])
+            if mask.any():
+                loss = loss + 5.0 * mse(out[mask, 1:], y[mask, 1:])
+            opt.zero_grad(); loss.backward(); opt.step()
+            tot += loss.item()
+        if (ep + 1) % 5 == 0:
+            print(f"  epoch {ep + 1}/{epochs}  loss {tot / max(1, n // bs):.3f}")
+    torch.save(net.state_dict(), "detector3d.pt")
+    return net, dev
+
+
+def eval_vs_range_3d(net, dev, renderer, per_bin=200, tol=0.09):
+    torch, _ = _torch()
+    rng = np.random.default_rng(1)
+    edges = np.linspace(NEAR3D, FAR3D, 11)
+    mids, rates = [], []
+    net.eval()
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        ok = 0
+        for _ in range(per_bin):
+            R = rng.uniform(lo, hi)
+            img, lab = render_frame_3d(rng, renderer, present=True, range_m=R)
+            with torch.no_grad():
+                out = net(torch.tensor(img)[None, None].to(dev)).cpu().numpy()[0]
+            if out[0] > 0 and np.hypot(out[1] - lab[1], out[2] - lab[2]) < tol:
+                ok += 1
+        mids.append((lo + hi) / 2); rates.append(ok / per_bin)
+    return mids, rates
+
+
+def _save_montage(renderer, path="sample3d.png"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    rng = np.random.default_rng(7)
+    fig, axs = plt.subplots(2, 4, figsize=(11, 5.5))
+    for ax, R in zip(axs.ravel(), [15, 20, 30, 45, 15, 25, 35, 55]):
+        img, _ = render_frame_3d(rng, renderer, present=True, range_m=float(R))
+        ax.imshow(img, cmap="gray", vmin=0, vmax=1); ax.set_title(f"{R} m", fontsize=9); ax.axis("off")
+    fig.suptitle("Rendered 3D drone frames (moderngl) — detector training images")
+    fig.tight_layout(); fig.savefig(path, dpi=110); print(f"saved {path}")
+
+
+def main3d():
+    renderer = _make_renderer()
+    _save_montage(renderer)
+    X, Y = build_3d_dataset(renderer)
+    net, dev = train_on_dataset(X, Y)
+    mids, rates = eval_vs_range_3d(net, dev, renderer)
+    for m, r in zip(mids, rates):
+        print(f"  {m:5.0f} m : {r:.2f}")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(mids, rates, "o-", lw=2, color="tab:green")
+    ax.set(xlabel="range to drone (m)", ylabel="detection rate",
+           title="Detection vs range — rendered 3D drone (moderngl)", ylim=(0, 1.02))
+    ax.grid(alpha=0.3); fig.tight_layout(); fig.savefig("detection3d.png", dpi=120)
+    print("saved detection3d.png + detector3d.pt")
+
+
 def main():
     net, dev = train_detector()
     mids, rates = eval_vs_range(net, dev)
@@ -228,4 +342,10 @@ def test():
 
 
 if __name__ == "__main__":
-    test() if (len(sys.argv) > 1 and sys.argv[1] == "test") else main()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "test":
+        test()
+    elif cmd == "3d":
+        main3d()
+    else:
+        main()

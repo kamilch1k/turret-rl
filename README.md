@@ -60,6 +60,27 @@ The real fixes are sensor *layering* (radar for early track, EO for terminal ref
 which is how real C-UAS works) or retraining the controller on the detector with memory.
 Reported as it came out — run it with `python sim.py perception`.
 
+**Realistic rendering (moderngl).** The detector above trains on procedural blobs;
+`render3d.py` upgrades that to a real lit **3D quadcopter** rendered in the *same*
+pinhole projection, composited over the domain-randomized backgrounds — so apparent
+size falls off with true perspective (no hand-tuned blob) and the label comes straight
+from `project()`. Up close the four-arm silhouette is legible; by ~45 m the drone sinks
+into sensor noise:
+
+![rendered frames](sample3d.png)
+
+Trained on 16k of these frames, detection peaks **~0.79 near 25 m** and collapses past
+~60 m as the drone drops toward a couple of pixels in clutter (the dip at the closest
+bin is the large near-silhouette clipping frame edges — a real artifact, left in):
+
+![detection 3d](detection3d.png)
+
+This is the honest reading of "train the model on realistic images": the realism that
+matters is a perspective-correct 3D object + varied backgrounds + a physical range
+falloff — *not* photorealism. It makes the detector's inputs real; it does **not** change
+the closed-loop finding above (that was geometry/range, not fidelity). Runs headless via
+`moderngl.create_standalone_context()` — no display needed.
+
 ## How the stages fit
 
 ```
@@ -75,7 +96,7 @@ sensor, not the render.
 ## Run
 
 ```
-pip install gymnasium stable-baselines3 matplotlib torch
+pip install gymnasium stable-baselines3 matplotlib torch moderngl
 python sim.py test               # physics + both env contracts
 python sim.py train [steps]      # turret vs scripted drone -> turret_ppo.zip
 python sim.py eval               # interception rate over 100 episodes
@@ -83,7 +104,9 @@ python sim.py watch              # render an episode -> episode.gif
 python sim.py selfplay [rounds]  # arms race -> selfplay.png
 python sim.py degrade [steps]    # perfect-vs-degraded-sensing benchmark -> degrade.png
 python sim.py perception         # detector-in-the-loop hit rate (image -> track -> policy)
-python detect.py                 # train perception stage -> detection.png + detector.pt
+python detect.py                 # train blob detector -> detection.png + detector.pt
+python detect.py 3d              # train on moderngl 3D frames -> sample3d.png + detection3d.png
+python render3d.py test          # 3D renderer: projection-match + size-falloff checks
 ```
 
 ## Scope & non-goals
@@ -95,8 +118,10 @@ Deliberate boundaries, stated up front:
   loop drops throughput ~100×) and isn't how real systems work — the controller
   consumes tracks. Images live in the detector stage. That's the correct
   architecture, not a shortcut.
-- **No Unreal/AirSim photorealism.** It wouldn't change the trained policy; the
-  renderer is a stylized demo on purpose.
+- **No Unreal/AirSim photorealism.** The detector trains on moderngl-rendered 3D
+  frames (real perspective + domain randomization) — the realism that matters for
+  detection. Photoreal rendering wouldn't change the policy, and the sim's demo
+  renderer is a stylized matplotlib view on purpose.
 - **Physics is point-mass**, not rotor-level 6-DOF — it captures the target
   motion envelope the turret cares about, not blade aerodynamics.
 - **The detector is fused into the live control loop** (`sim.py perception`), which
