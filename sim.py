@@ -396,41 +396,113 @@ def selfplay(rounds=4, steps=500_000):
     print("saved selfplay.png + turret_selfplay.zip / drone_selfplay.zip")
 
 
+def _circle3d(c, n, r, k=14):
+    """Ring of k points, radius r, centered at c in the plane with normal n."""
+    n = _unit(n)
+    u = _unit(np.cross(n, [0, 0, 1.0] if abs(n[2]) < 0.9 else [1.0, 0, 0]))
+    v = np.cross(n, u)
+    th = np.linspace(0, 2 * np.pi, k)
+    return c[:, None] + r * (np.outer(u, np.cos(th)) + np.outer(v, np.sin(th)))
+
+
+def _rollout_hit(model, tries=25):
+    """Run episodes until the turret scores an intercept, so the demo shows a kill.
+    Records (drone, vel, barrel, shots[(pos,vel)]) per step. Falls back to last try."""
+    env = TurretEnv()
+    best = None
+    for _ in range(tries):
+        obs, _ = env.reset()
+        frames = []
+        while True:
+            act, _ = model.predict(obs, deterministic=True)
+            obs, _, term, trunc, info = env.step(act)
+            w = env.world
+            frames.append((w.drone.copy(), w.drone_vel.copy(), w.barrel(),
+                           [(p.copy(), vel.copy()) for p, vel, _ in w.shots]))
+            if term or trunc:
+                break
+        best = frames
+        if info["hit"]:
+            return frames, True
+    return best, False
+
+
 def watch():
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation, PillowWriter
+    from PIL import Image
     from stable_baselines3 import PPO
 
-    model = PPO.load("turret_ppo")
-    env = TurretEnv()
-    obs, _ = env.reset()
-    frames = []
-    while True:
-        act, _ = model.predict(obs, deterministic=True)
-        obs, _, term, trunc, info = env.step(act)
-        w = env.world
-        frames.append((w.drone.copy(), w.barrel(), [p.copy() for p, _, _ in w.shots]))
-        if term or trunc:
-            print("HIT" if info["hit"] else "drone survived/reached asset")
-            break
+    frames, hit = _rollout_hit(PPO.load("turret_ppo"))
+    print("HIT" if hit else "no intercept in sample; rendering last episode")
+    n = len(frames)
+    drones = np.array([f[0] for f in frames])
 
-    fig = plt.figure(figsize=(7, 7))
+    fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(projection="3d")
+    SKY, GND = (0.53, 0.72, 0.90), (0.82, 0.80, 0.74)
 
     def draw(i):
         ax.clear()
-        drone, barrel, shots = frames[i]
-        ax.scatter(0, 0, 0, c="k", marker="s", s=60)
-        b = barrel * 15
-        ax.plot([0, b[0]], [0, b[1]], [0, b[2]], "k-")
-        ax.scatter(*drone, c="r", s=40)
-        for p in shots:
-            ax.scatter(*p, c="orange", s=8)
-        ax.set(xlim=(-200, 200), ylim=(-200, 200), zlim=(0, 100), title=f"t={i * DT:.1f}s")
+        drone, vel, barrel, shots = frames[i]
+        # sky + ground via pane colors and a ground grid
+        for axis, col in ((ax.xaxis, SKY), (ax.yaxis, SKY), (ax.zaxis, GND)):
+            axis.set_pane_color((*col, 1.0))
+        gx = np.linspace(-160, 160, 9)
+        for g in gx:
+            ax.plot([g, g], [-160, 160], [0, 0], color=(0, 0, 0, 0.10), lw=0.6)
+            ax.plot([-160, 160], [g, g], [0, 0], color=(0, 0, 0, 0.10), lw=0.6)
 
-    anim = FuncAnimation(fig, draw, frames=len(frames), interval=50)
-    anim.save("episode.gif", writer=PillowWriter(fps=20))
-    print(f"saved episode.gif ({len(frames)} frames)")
+        # turret: base marker + barrel
+        ax.scatter(0, 0, 0, c="k", marker="s", s=80)
+        b = barrel * 18
+        ax.plot([0, b[0]], [0, b[1]], [0, b[2]], "k-", lw=2)
+
+        # drone trail
+        tr = drones[max(0, i - 25):i + 1]
+        if len(tr) > 1:
+            ax.plot(tr[:, 0], tr[:, 1], tr[:, 2], color=(0.8, 0.1, 0.1, 0.5), lw=1.5)
+
+        # drone as a banking quad: 4 rotor disks on an X frame
+        fwd = vel.copy(); fwd[2] = 0
+        fwd = _unit(fwd) if np.linalg.norm(fwd) > 1e-6 else np.array([1.0, 0, 0])
+        right = _unit(np.cross(fwd, [0, 0, 1.0]))
+        accel = (vel - frames[i - 1][1]) if i > 0 else np.zeros(3)   # bank into the turn
+        roll = float(np.clip(-0.04 * np.dot(accel, right), -0.6, 0.6))
+        up = _unit(np.array([0, 0, 1.0]) * np.cos(roll) + right * np.sin(roll))
+        right = _unit(np.cross(fwd, up))
+        arm = 5.0
+        for a, s in [(1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            rc = drone + arm * (a * fwd + s * right)
+            ax.plot([drone[0], rc[0]], [drone[1], rc[1]], [drone[2], rc[2]], "k-", lw=1)
+            ring = _circle3d(rc, up, 2.2)
+            ax.plot(ring[0], ring[1], ring[2], color="k", lw=1.2)
+        ax.scatter(*drone, c="crimson", s=30)
+
+        # projectile tracers
+        for p, pv in shots:
+            tail = p - _unit(pv) * 6
+            ax.plot([tail[0], p[0]], [tail[1], p[1]], [tail[2], p[2]], color="orange", lw=2)
+
+        # tracking camera: frame turret+drone, slow orbit
+        c = drone / 2.0
+        rad = max(60.0, np.linalg.norm(drone) * 0.6)
+        ax.set(xlim=(c[0] - rad, c[0] + rad), ylim=(c[1] - rad, c[1] + rad), zlim=(0, max(60, drone[2] + 30)))
+        ax.view_init(elev=22, azim=-60 + i * 0.35)
+        ax.set_title(f"t = {i * DT:4.1f} s" + ("     ● INTERCEPT" if hit and i == n - 1 else ""))
+        ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+
+    seq = list(range(0, n, 2)) + [n - 1] * 6  # every other frame + linger on the kill
+    imgs = []
+    for i in seq:
+        draw(i)
+        fig.canvas.draw()
+        rgb = Image.fromarray(np.asarray(fig.canvas.buffer_rgba())).convert("RGB")
+        imgs.append(rgb.convert("P", palette=Image.ADAPTIVE, colors=96))
+    imgs[0].save("episode.gif", save_all=True, append_images=imgs[1:],
+                 duration=80, loop=0, optimize=True, disposal=2)
+    print(f"saved episode.gif ({len(imgs)} frames)")
 
 
 if __name__ == "__main__":
