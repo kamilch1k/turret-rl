@@ -15,6 +15,7 @@ Usage:
 """
 
 import sys
+from collections import deque
 
 import numpy as np
 import gymnasium as gym
@@ -76,9 +77,12 @@ class World:
             acc = acc + amp * np.sin(freq * tt + ph) * b
         return acc
 
-    def turret_obs(self, rng):
-        pos = self.drone + rng.normal(0, OBS_NOISE, 3)   # ponytail: perfect-detection noisy sensor; add dropout/latency for realism
-        vel = self.drone_vel + rng.normal(0, 1.0, 3)
+    def turret_obs(self, rng, sensor=None):
+        if sensor is None:                               # clean: perfect detection, light noise
+            pos = self.drone + rng.normal(0, OBS_NOISE, 3)
+            vel = self.drone_vel + rng.normal(0, 1.0, 3)
+        else:                                            # degraded: dropout + latency + range-scaled noise
+            pos, vel = sensor.measure(self.drone, self.drone_vel, rng)
         return np.concatenate([
             pos / 200.0, vel / 50.0,
             [np.sin(self.az), np.cos(self.az), self.el,
@@ -139,22 +143,53 @@ class World:
         return hit, reached, fired, nearmiss
 
 
+class Sensor:
+    """Realistic track: detection dropout, pipeline latency, range-scaled noise.
+    Real fire control never sees the true state — it sees this, and the dropout/
+    latency (not the Gaussian jitter) are what actually break a perfect-info policy."""
+
+    # defaults model a rough but defensible small-FPV track: ~300 ms pipeline latency,
+    # heavy dropout that worsens with range, localization noise that grows with range
+    def __init__(self, latency=6, p_drop=0.4, noise0=3.0, ref_range=150.0):
+        self.latency, self.p_drop = latency, p_drop
+        self.noise0, self.ref = noise0, ref_range
+
+    def reset(self, pos, vel):
+        self.buf = deque([(pos.copy(), vel.copy())] * (self.latency + 1),
+                         maxlen=self.latency + 1)
+        self.last = (pos.copy(), vel.copy())
+
+    def measure(self, true_pos, true_vel, rng):
+        self.buf.append((true_pos.copy(), true_vel.copy()))
+        dpos, dvel = self.buf[0]                          # delayed by `latency` ticks
+        k = np.linalg.norm(dpos) / self.ref              # range factor: worse far away
+        if rng.random() < min(0.9, self.p_drop * (1 + k)):
+            return self.last                             # dropout -> hold last track
+        n = self.noise0 * (1 + k)
+        m = (dpos + rng.normal(0, n, 3), dvel + rng.normal(0, 0.7 * n, 3))
+        self.last = m
+        return m
+
+
 class TurretEnv(gym.Env):
     """Agent = turret. Opponent drone: scripted (None) or a frozen PPO policy."""
 
     metadata = {"render_modes": []}
 
-    def __init__(self, opponent_drone=None):
+    def __init__(self, opponent_drone=None, degrade=False):
         self.observation_space = spaces.Box(-np.inf, np.inf, (11,), np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)  # az rate, el rate, fire>0
         self.opponent = opponent_drone
         self.world = World()
+        self.sensor = Sensor() if degrade else None
         self._freeze_drone = False  # test hook
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.world.reset(self.np_random)
-        return self.world.turret_obs(self.np_random), {}
+        if self.sensor is not None:
+            self.sensor.reset(self.world.drone, self.world.drone_vel)
+        return self.world.turret_obs(self.np_random, self.sensor), {}
 
     def _drone_accel(self):
         if self._freeze_drone:
@@ -175,7 +210,7 @@ class TurretEnv(gym.Env):
         elif reached:
             reward, terminated = reward - 10.0, True
         trunc = self.world.t >= EP_LEN
-        return self.world.turret_obs(self.np_random), reward, terminated, trunc, {"hit": hit}
+        return self.world.turret_obs(self.np_random, self.sensor), reward, terminated, trunc, {"hit": hit}
 
 
 class DroneEnv(gym.Env):
@@ -214,9 +249,9 @@ class DroneEnv(gym.Env):
         return self.world.drone_obs(), reward, terminated, trunc, {"reached": reached}
 
 
-def hit_rate(turret_model, drone_model=None, episodes=100):
+def hit_rate(turret_model, drone_model=None, episodes=100, degrade=False):
     """Turret interception rate against the given drone (scripted if None)."""
-    env = TurretEnv(opponent_drone=drone_model)
+    env = TurretEnv(opponent_drone=drone_model, degrade=degrade)
     hits = 0
     for i in range(episodes):
         obs, _ = env.reset(seed=2000 + i)
@@ -271,6 +306,42 @@ def train(steps=300_000):
 def evaluate():
     from stable_baselines3 import PPO
     print(f"hit rate: {hit_rate(PPO.load('turret_ppo')):.2f}")
+
+
+def degrade_benchmark(steps=2_000_000):
+    """Show that perfect-info training is fragile: a clean-trained policy collapses
+    under realistic sensing (dropout/latency/range noise), and a policy trained on
+    that same degraded sensing recovers most of the gap. This is the honest way to
+    add 'realism' — in the sensor model, not the graphics."""
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.env_util import make_vec_env
+
+    clean = PPO.load("turret_ppo")
+    base = hit_rate(clean)                       # clean policy on clean sensing
+    fragile = hit_rate(clean, degrade=True)      # clean policy on degraded sensing
+    print(f"clean/clean {base:.2f} | clean/degraded {fragile:.2f}")
+
+    model = PPO("MlpPolicy", make_vec_env(TurretEnv, n_envs=8,
+                                          env_kwargs={"degrade": True}), verbose=1)
+    model.learn(total_timesteps=steps)
+    model.save("turret_degraded")
+    robust = hit_rate(model, degrade=True)       # degraded-trained policy on degraded sensing
+    print(f"degraded/degraded {robust:.2f}")
+
+    import matplotlib.pyplot as plt
+    labels = ["clean policy\nclean sensing", "clean policy\ndegraded sensing",
+              "degraded-trained\ndegraded sensing"]
+    vals, colors = [base, fragile, robust], ["tab:green", "tab:red", "tab:blue"]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.bar(labels, vals, color=colors)
+    for i, v in enumerate(vals):
+        ax.annotate(f"{v:.2f}", (i, v), textcoords="offset points", xytext=(0, 5), ha="center")
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("interception rate")
+    ax.set_title("Perception realism: a perfect-info policy is fragile")
+    fig.tight_layout()
+    fig.savefig("degrade.png", dpi=120)
+    print("saved degrade.png + turret_degraded.zip")
 
 
 def selfplay(rounds=4, steps=500_000):
@@ -373,5 +444,7 @@ if __name__ == "__main__":
         evaluate()
     elif cmd == "selfplay":
         selfplay(arg or 4)
+    elif cmd == "degrade":
+        degrade_benchmark(arg or 2_000_000)
     else:
         test()
