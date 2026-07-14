@@ -81,8 +81,8 @@ class World:
         if sensor is None:                               # clean: perfect detection, light noise
             pos = self.drone + rng.normal(0, OBS_NOISE, 3)
             vel = self.drone_vel + rng.normal(0, 1.0, 3)
-        else:                                            # degraded: dropout + latency + range-scaled noise
-            pos, vel = sensor.measure(self.drone, self.drone_vel, rng)
+        else:                                            # sensor model (degraded track or image detector)
+            pos, vel = sensor.measure(self, rng)
         return np.concatenate([
             pos / 200.0, vel / 50.0,
             [np.sin(self.az), np.cos(self.az), self.el,
@@ -154,13 +154,14 @@ class Sensor:
         self.latency, self.p_drop = latency, p_drop
         self.noise0, self.ref = noise0, ref_range
 
-    def reset(self, pos, vel):
+    def reset(self, world, rng):
+        pos, vel = world.drone, world.drone_vel
         self.buf = deque([(pos.copy(), vel.copy())] * (self.latency + 1),
                          maxlen=self.latency + 1)
         self.last = (pos.copy(), vel.copy())
 
-    def measure(self, true_pos, true_vel, rng):
-        self.buf.append((true_pos.copy(), true_vel.copy()))
+    def measure(self, world, rng):
+        self.buf.append((world.drone.copy(), world.drone_vel.copy()))
         dpos, dvel = self.buf[0]                          # delayed by `latency` ticks
         k = np.linalg.norm(dpos) / self.ref              # range factor: worse far away
         if rng.random() < min(0.9, self.p_drop * (1 + k)):
@@ -171,24 +172,59 @@ class Sensor:
         return m
 
 
+class DetectorSensor:
+    """Image-based track: render the barrel-slaved camera frame, run the CNN
+    detector, back-project its bearing (+ rangefinder range) to a 3D position,
+    finite-difference velocity. Radar-cued at reset; holds the last track on a
+    miss. Plugs into the same env slot as Sensor (reset/measure -> pos, vel).
+    ponytail: single-env only (holds tracker state); use a factory for vec-envs."""
+
+    def __init__(self, path="detector.pt"):
+        import torch
+        import detect
+        self.torch, self.detect = torch, detect
+        self.dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.net = detect.make_net().to(self.dev)
+        self.net.load_state_dict(torch.load(path, map_location=self.dev))
+        self.net.eval()
+
+    def reset(self, world, rng):
+        self.est = world.drone + rng.normal(0, 5.0, 3)   # radar cue: coarse, camera refines
+        self.vel = world.drone_vel.copy()
+
+    def measure(self, world, rng):
+        det = self.detect
+        in_view, u, v, R = det.project(world.drone, world.az, world.el)
+        img, _ = det.render_frame(rng, present=in_view, range_m=R,
+                                  uv=(u, v) if in_view else None)
+        with self.torch.no_grad():
+            out = self.net(self.torch.tensor(img)[None, None].to(self.dev)).cpu().numpy()[0]
+        if in_view and out[0] > 0:                        # detected
+            Rn = R + rng.normal(0, 0.05 * R)             # rangefinder range (monocular can't range -> fuse)
+            new = det.backproject(out[1], out[2], Rn, world.az, world.el)
+            self.vel = 0.6 * self.vel + 0.4 * (new - self.est) / DT   # ponytail: EMA, a real tracker filters
+            self.est = new
+        return self.est, self.vel                         # miss -> hold last track
+
+
 class TurretEnv(gym.Env):
     """Agent = turret. Opponent drone: scripted (None) or a frozen PPO policy."""
 
     metadata = {"render_modes": []}
 
-    def __init__(self, opponent_drone=None, degrade=False):
+    def __init__(self, opponent_drone=None, degrade=False, sensor=None):
         self.observation_space = spaces.Box(-np.inf, np.inf, (11,), np.float32)
         self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)  # az rate, el rate, fire>0
         self.opponent = opponent_drone
         self.world = World()
-        self.sensor = Sensor() if degrade else None
+        self.sensor = sensor if sensor is not None else (Sensor() if degrade else None)
         self._freeze_drone = False  # test hook
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.world.reset(self.np_random)
         if self.sensor is not None:
-            self.sensor.reset(self.world.drone, self.world.drone_vel)
+            self.sensor.reset(self.world, self.np_random)
         return self.world.turret_obs(self.np_random, self.sensor), {}
 
     def _drone_accel(self):
@@ -249,9 +285,9 @@ class DroneEnv(gym.Env):
         return self.world.drone_obs(), reward, terminated, trunc, {"reached": reached}
 
 
-def hit_rate(turret_model, drone_model=None, episodes=100, degrade=False):
+def hit_rate(turret_model, drone_model=None, episodes=100, degrade=False, sensor=None):
     """Turret interception rate against the given drone (scripted if None)."""
-    env = TurretEnv(opponent_drone=drone_model, degrade=degrade)
+    env = TurretEnv(opponent_drone=drone_model, degrade=degrade, sensor=sensor)
     hits = 0
     for i in range(episodes):
         obs, _ = env.reset(seed=2000 + i)
@@ -306,6 +342,16 @@ def train(steps=300_000):
 def evaluate():
     from stable_baselines3 import PPO
     print(f"hit rate: {hit_rate(PPO.load('turret_ppo')):.2f}")
+
+
+def eval_perception(episodes=50):
+    """End-to-end perception-in-the-loop: image -> CNN detector -> back-projected
+    track -> the existing turret policy. The honest 'trained on images' number."""
+    from stable_baselines3 import PPO
+    turret = PPO.load("turret_ppo")
+    truth = hit_rate(turret, episodes=episodes)
+    percept = hit_rate(turret, episodes=episodes, sensor=DetectorSensor())
+    print(f"perception-in-the-loop hit rate: {percept:.2f}  (vs {truth:.2f} ground-truth)")
 
 
 def degrade_benchmark(steps=2_000_000):
@@ -520,5 +566,7 @@ if __name__ == "__main__":
         selfplay(arg or 4)
     elif cmd == "degrade":
         degrade_benchmark(arg or 2_000_000)
+    elif cmd == "perception":
+        eval_perception(arg or 50)
     else:
         test()

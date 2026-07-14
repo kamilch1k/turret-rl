@@ -41,11 +41,24 @@ That's a real experimental result, reported as it came out:
 ![sensing](degrade.png)
 
 **Perception breaks with range.** The turret consumes a *track*, not pixels — the
-"find the drone" problem is a separate detector. A small CNN on synthetic camera
-frames holds ~90% detection in a 35–65 m sweet spot and collapses past ~70 m as
-the drone shrinks toward a single low-contrast pixel and sinks into sensor noise:
+"find the drone" problem is a separate CNN detector trained on domain-randomized
+synthetic frames (sky, ground band, clouds, noise, dark distractors). Detection is
+near-perfect up close (0.96–0.98 at 25–45 m) and collapses past ~65 m as the drone
+shrinks toward a single low-contrast pixel and sinks into clutter:
 
 ![detection](detection.png)
+
+**Closing the loop is where it gets honest.** Wiring the detector in as the turret's
+actual sensor (`DetectorSensor`: render → CNN → back-projected bearing + rangefinder
+range → track) drops the 82% policy to **0.12** (vs 0.78 on ground-truth). The cause
+is diagnostic, not a bug: the detector's usable range (~65 m) is *far shorter than the
+120–180 m engagement*, so the barrel-slaved camera is blind for most of the approach,
+and a policy trained on full-state info can't recover in the ~2 s terminal window once
+the drone finally becomes visible. Same lesson as the sensor benchmark: **perception
+limits dominate — you can't bolt a realistic sensor onto an idealized policy for free.**
+The real fixes are sensor *layering* (radar for early track, EO for terminal refinement,
+which is how real C-UAS works) or retraining the controller on the detector with memory.
+Reported as it came out — run it with `python sim.py perception`.
 
 ## How the stages fit
 
@@ -69,7 +82,8 @@ python sim.py eval               # interception rate over 100 episodes
 python sim.py watch              # render an episode -> episode.gif
 python sim.py selfplay [rounds]  # arms race -> selfplay.png
 python sim.py degrade [steps]    # perfect-vs-degraded-sensing benchmark -> degrade.png
-python detect.py                 # perception stage -> detection.png
+python sim.py perception         # detector-in-the-loop hit rate (image -> track -> policy)
+python detect.py                 # train perception stage -> detection.png + detector.pt
 ```
 
 ## Scope & non-goals
@@ -85,6 +99,8 @@ Deliberate boundaries, stated up front:
   renderer is a stylized demo on purpose.
 - **Physics is point-mass**, not rotor-level 6-DOF — it captures the target
   motion envelope the turret cares about, not blade aerodynamics.
-- **A fuller perception pipeline would** train the detector on real anti-UAV
-  imagery (Anti-UAV, Drone-vs-Bird) instead of synthetic frames, add clutter and
-  false-positive metrics, and fuse detector output into the live control loop.
+- **The detector is fused into the live control loop** (`sim.py perception`), which
+  exposed the range-mismatch problem above. A fuller pipeline would train it on real
+  anti-UAV imagery (Anti-UAV, Drone-vs-Bird) instead of synthetic frames, add
+  false-positive metrics, layer a longer-range sensor for early track, and retrain
+  the controller (with memory) on the fused sensor.
