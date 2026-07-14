@@ -309,10 +309,12 @@ def evaluate():
 
 
 def degrade_benchmark(steps=2_000_000):
-    """Show that perfect-info training is fragile: a clean-trained policy collapses
-    under realistic sensing (dropout/latency/range noise), and a policy trained on
-    that same degraded sensing recovers most of the gap. This is the honest way to
-    add 'realism' — in the sensor model, not the graphics."""
+    """Measure how the clean-trained turret holds up under realistic sensing
+    (dropout/latency/range-noise), and whether naively retraining on that degraded
+    sensor helps. Result (this setup): the clean policy degrades gracefully, and
+    naive retraining is actually WORSE — dropout+latency make it a partially-observed
+    problem a memoryless MLP can't crack without frame-history/RNN. The honest place
+    to add realism is the sensor model, not the graphics."""
     from stable_baselines3 import PPO
     from stable_baselines3.common.env_util import make_vec_env
 
@@ -331,14 +333,14 @@ def degrade_benchmark(steps=2_000_000):
     import matplotlib.pyplot as plt
     labels = ["clean policy\nclean sensing", "clean policy\ndegraded sensing",
               "degraded-trained\ndegraded sensing"]
-    vals, colors = [base, fragile, robust], ["tab:green", "tab:red", "tab:blue"]
+    vals, colors = [base, fragile, robust], ["tab:green", "tab:orange", "tab:red"]
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.bar(labels, vals, color=colors)
     for i, v in enumerate(vals):
         ax.annotate(f"{v:.2f}", (i, v), textcoords="offset points", xytext=(0, 5), ha="center")
     ax.set_ylim(0, 1)
     ax.set_ylabel("interception rate")
-    ax.set_title("Perception realism: a perfect-info policy is fragile")
+    ax.set_title("Realistic sensing: clean policy degrades gracefully;\nnaive retraining is worse (needs memory, not just noise)")
     fig.tight_layout()
     fig.savefig("degrade.png", dpi=120)
     print("saved degrade.png + turret_degraded.zip")
