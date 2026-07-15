@@ -47,11 +47,22 @@ def _background(rng, res=RES):
     return np.clip(img, 0, 1)
 
 
-def render_scene(drone_rel, az, el, rng, renderer):
-    """Composite the 3D drone over a randomized background -> (rgb uint8, mask)."""
+def render_scene(drone_rel, az, el, rng, renderer, haze=0.0, clutter=0):
+    """Composite the 3D drone over a randomized background -> (rgb uint8, mask).
+    haze fades drone contrast with range (optical low-contrast regime); clutter adds
+    dark confuser blobs. Both attack the EO detector without touching a radar track."""
     bg = _background(rng)
+    if clutter:
+        yy, xx = np.mgrid[0:RES, 0:RES]
+        for _ in range(clutter):
+            du, dv, dr = rng.uniform(0, RES), rng.uniform(0, RES), rng.uniform(3, 11)
+            bg = bg - (rng.uniform(0.1, 0.3) * np.exp(-((xx - du) ** 2 + (yy - dv) ** 2) / (2 * dr ** 2)))[..., None]
+        bg = np.clip(bg, 0, 1)
     gray, mask = renderer.render(drone_rel, az, el)
-    m = mask[..., None]
+    contrast = 1.0
+    if haze:
+        contrast = max(0.0, 1.0 - haze * min(float(np.linalg.norm(drone_rel)) / 130.0, 1.0))
+    m = mask[..., None] * contrast
     rgb = bg * (1 - m) + np.stack([gray] * 3, -1) * m
     return (np.clip(rgb, 0, 1) * 255).astype(np.uint8), mask
 
@@ -66,19 +77,23 @@ class YoloSensor:
     detects, back-projects the top box center (+ rangefinder range). Same slot as
     DetectorSensor. Single-env (holds tracker state + one GL ctx + one model)."""
 
-    def __init__(self, weights=None, conf=0.25):
+    def __init__(self, weights=None, conf=0.25, haze=0.0, clutter=0):
         from ultralytics import YOLO
         self.model = YOLO(weights or _find("drone"))           # the yolo_real.py run
-        self.conf = conf
+        self.conf, self.haze, self.clutter = conf, haze, clutter
         self.renderer = render3d.DroneRenderer(img=RES, fov_deg=FOV, size=SIZE)
+        self.detected = False
 
     def reset(self, world, rng):
         self.est = world.drone + rng.normal(0, 5.0, 3)         # radar cue
         self.vel = world.drone_vel.copy()
+        self.detected = False
 
     def measure(self, world, rng):
-        rgb, _ = render_scene(world.drone, world.az, world.el, rng, self.renderer)
+        rgb, _ = render_scene(world.drone, world.az, world.el, rng, self.renderer,
+                              haze=self.haze, clutter=self.clutter)
         res = self.model.predict(rgb, conf=self.conf, imgsz=RES, verbose=False)[0]
+        self.detected = len(res.boxes) > 0
         if len(res.boxes):
             b = res.boxes.xywhn.cpu().numpy()
             u, v = b[int(res.boxes.conf.argmax())][:2]         # top-conf box center, normalized

@@ -122,6 +122,26 @@ control. (Confound, stated: the YOLO sensor renders at 640 px vs the tiny CNN's 
 it's detector *and* resolution — but the takeaway, that a real detector suffices, holds
 either way.) `python loop_yolo.py loop`
 
+**Sensor fusion is the robustness answer.** The two threads left open above — a genuine
+low-contrast/long-range regime, and the blind early approach — resolve into one experiment
+(`research.py`). Harden the EO frames with haze (range-faded contrast) + clutter until the
+YOLO sensor breaks, and sweep three sensors:
+
+![fusion](research.png)
+
+- **EO-alone collapses** as it hazes — **0.73 → 0.37 → 0.18.** A precise detector is
+  useless when it can't see.
+- **Radar-alone is flat at 0.70** — a coarse but always-available track (`sim.Sensor`),
+  image-independent by construction, so haze doesn't touch it.
+- **Layered (radar cue + EO terminal) stays robust — 0.77 → 0.75 → 0.73.** It beats EO's
+  precision when the air is clear (0.77 > 0.70) and falls back to radar's floor when EO goes
+  blind (0.73 vs 0.18) — matching or beating the *better* single sensor at every regime.
+
+That's the textbook counter-UAS result, earned rather than asserted: EO and radar fail in
+*different* ways (optical contrast vs geometry), so no single sensor is robust everywhere and
+a layered cue is. (The fusion is a plain EO-preferred switch, not a Kalman filter — enough to
+show the effect; a real system filters both into one calibrated track.) `python research.py`
+
 ## How the stages fit
 
 ```
@@ -151,6 +171,9 @@ python render3d.py test          # 3D renderer: projection-match + size-falloff 
 python yolo_real.py prepare      # real HF dataset (parquet) -> yolo_ds/ YOLO format
 python yolo_real.py train [ep]   # fine-tune yolo11n on real photos (GPU) -> runs/
 python yolo_real.py curve        # recall-vs-size + sample predictions on real data
+python loop_yolo.py gap          # real-photo YOLO on sim frames -> ~0.97 (no domain gap)
+python loop_yolo.py loop         # real YOLO in the control loop -> 0.74 closed-loop
+python research.py               # EO/radar/fusion sweep over haze -> research.png
 ```
 
 The real-image detector needs `pip install ultralytics pyarrow`, a CUDA torch, and
@@ -173,6 +196,7 @@ Deliberate boundaries, stated up front:
   motion envelope the turret cares about, not blade aerodynamics.
 - **The real YOLO detector is both standalone and wired into the loop** (`yolo_real.py`
   mAP@50 0.974; `loop_yolo.py` closed-loop 0.74). No domain bridge was needed — it
-  generalizes to the sim's rendered frames as-is. What's still open: a genuine long-range /
-  low-contrast regime (where even YOLO would degrade), and fusing a longer-range sensor for
-  the blind early approach.
+  generalizes to the sim's rendered frames as-is. The low-contrast regime and longer-range
+  sensor fusion — once the open threads — are now the `research.py` result: EO collapses in
+  haze while a layered radar+EO cue stays robust. What genuinely remains: a learned (Kalman)
+  fusion filter, and validating the whole stack on real footage rather than rendered frames.
