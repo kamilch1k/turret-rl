@@ -10,6 +10,21 @@ are in a real counter-UAS system — not fused into one magic pixel-to-action bo
 
 *PPO turret (black, at origin) intercepting an evasive quad. Red = drone trail, orange = projectile tracers. Camera tracks and zooms toward the kill.*
 
+## Results at a glance
+
+| Experiment | Result | The honest finding |
+|---|---|---|
+| Turret vs scripted drone | **82/100** intercept | learns lead prediction under noisy sensing |
+| Self-play arms race | sawtooth 0.02 ↔ 0.76 | naive best-response oscillates, doesn't converge |
+| Degraded-sensor benchmark | 0.81 → 0.69; retrain **0.38** | "train on the noisy sensor" *hurt* — a memoryless MLP can't |
+| Synthetic detector, in-loop | **0.12** closed-loop | *looked* like a hard range-geometry limit… |
+| Real-image YOLO (standalone) | mAP@50 **0.974** | a pretrained detector barely degrades with size |
+| Real YOLO in the loop | **0.74** (vs 0.12) | …it wasn't geometry — it was the weak detector |
+| Sensor-fusion sweep | EO 0.73→0.18, layered **0.77→0.73** | fusion stays robust where either sensor alone fails |
+
+Three of these overturned an earlier finding of mine (the 0.12 → 0.74 reversal especially).
+Each is written up as it actually happened — including being wrong — not smoothed over.
+
 ## Results
 
 **Turret vs scripted drone — 82/100 interceptions** (2M steps, ~25 min on one laptop).
