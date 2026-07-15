@@ -54,11 +54,12 @@ range → track) drops the 82% policy to **0.12** (vs 0.78 on ground-truth). The
 is diagnostic, not a bug: the detector's usable range (~65 m) is *far shorter than the
 120–180 m engagement*, so the barrel-slaved camera is blind for most of the approach,
 and a policy trained on full-state info can't recover in the ~2 s terminal window once
-the drone finally becomes visible. Same lesson as the sensor benchmark: **perception
-limits dominate — you can't bolt a realistic sensor onto an idealized policy for free.**
-The real fixes are sensor *layering* (radar for early track, EO for terminal refinement,
-which is how real C-UAS works) or retraining the controller on the detector with memory.
-Reported as it came out — run it with `python sim.py perception`.
+the drone finally becomes visible. That *looked* like a fundamental limit — perception
+dominates, you can't bolt a realistic sensor onto an idealized policy for free. **It
+wasn't.** Swapping the toy CNN for a real detector (see "A strong detector nearly closes
+the loop" below) recovers almost all of it, so the 0.12 was the *weak detector + 64 px
+frames*, not the range geometry. Left standing and corrected below, because that reversal
+is the most useful thing in the repo. (`python sim.py perception`)
 
 **Realistic rendering (moderngl).** The detector above trains on procedural blobs;
 `render3d.py` upgrades that to a real lit **3D quadcopter** rendered in the *same*
@@ -103,6 +104,23 @@ reflects this dataset's size distribution and that its "small" drones are still 
 visible; a genuine long-range/low-contrast set would push it back down.) This detector is
 standalone — real photos don't share the sim's engagement geometry — so it complements the
 in-loop synthetic detector rather than replacing it.
+
+**A strong detector nearly closes the loop.** So is closing the loop actually hard? I
+wired the *real-photo YOLO* (above) straight into the sensor slot (`loop_yolo.py`,
+`YoloSensor`) — rendering the sim's barrel-slaved view at 640 px and letting YOLO detect.
+Two findings, both against my prior:
+
+- **No domain gap.** The real-photo detector fires on the moderngl sim frames at **0.97**
+  with zero sim-specific retraining — a dark quad against sky/ground reads as a drone to
+  it, so the real detector needs no bridge to drive the sim.
+- **Closed-loop hit rate 0.74** — vs the tiny-CNN's 0.12 and ground-truth's 0.78. A strong
+  detector at adequate resolution nearly closes the sim-to-track gap.
+
+So the earlier 0.12 "perception dominates" story was measuring a *weak detector*, not a
+hard problem: a capable off-the-shelf model, no retrain, recovers ~95% of ground-truth
+control. (Confound, stated: the YOLO sensor renders at 640 px vs the tiny CNN's 64 px, so
+it's detector *and* resolution — but the takeaway, that a real detector suffices, holds
+either way.) `python loop_yolo.py loop`
 
 ## How the stages fit
 
@@ -153,9 +171,8 @@ Deliberate boundaries, stated up front:
   renderer is a stylized matplotlib view on purpose.
 - **Physics is point-mass**, not rotor-level 6-DOF — it captures the target
   motion envelope the turret cares about, not blade aerodynamics.
-- **Real imagery is now covered by the YOLO detector** (`yolo_real.py`, mAP@50 0.974),
-  but *standalone* — it isn't wired into the live control loop, because real photos don't
-  share the sim's engagement geometry. Fusing a real-trained detector into the loop would
-  need a domain bridge (render the sim through a real-image style, or key the controller
-  off detections in real footage), plus a longer-range sensor for early track and a
-  controller retrained (with memory) on the fused sensor.
+- **The real YOLO detector is both standalone and wired into the loop** (`yolo_real.py`
+  mAP@50 0.974; `loop_yolo.py` closed-loop 0.74). No domain bridge was needed — it
+  generalizes to the sim's rendered frames as-is. What's still open: a genuine long-range /
+  low-contrast regime (where even YOLO would degrade), and fusing a longer-range sensor for
+  the blind early approach.
